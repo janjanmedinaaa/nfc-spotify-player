@@ -29,6 +29,7 @@
 #include <SpotifyArduino.h>
 #include <ArduinoJson.h>
 #include <WiFiManager.h>
+#include <time.h>
 
 #define RST_PIN         D3
 #define SS_PIN          D8
@@ -38,17 +39,24 @@
 
 MFRC522 mfrc522(SS_PIN, RST_PIN);  // Create MFRC522 instance
 
-#define MDNS_DOMAIN "magicbox"
-#define APSSID "Magic Box"
+#define MDNS_DOMAIN "spotbox"
+#define APSSID "Spot Box"
 #define SPOTIFY_DETAILS_FILE "/spotifyauth.txt"
 #define SPOTIFY_DEVICE_FILE "/spotifydevice.txt"
 
 #define SPOTIFY_MARKET "PH"
 #define SPOTIFY_SCOPE "user-read-playback-state%20user-modify-playback-state"
-#define CALLBACK_URI "http%3A%2F%2Fmagicbox.local%2Fcallback"
+#define CALLBACK_URI "http%3A%2F%2Fspotbox.local%2Fcallback"
+
+#define MY_NTP_SERVER "asia.pool.ntp.org"           
+#define MY_TZ "PST-8"   
+
+#define LED_OFF_HOUR 21
+#define LED_ON_HOUR 6
 
 unsigned long MAX_SPOTIFY_POLLING_TIME = 60 * 5 * 1000;
 unsigned long MAX_SPOTIFY_POLLING_DELAY = 30 * 1000;
+unsigned long MAX_NTP_POLLING_DELAY = 10 * 1000;
 
 byte const BUFFERSiZE = 176;
 uint8_t control = 0x00;
@@ -67,6 +75,11 @@ WiFiClientSecure client;
 WiFiManager wm;
 SpotifyArduino spotify(client, CLIENT_ID, CLIENT_SECRET);
 
+time_t now;
+tm tm;
+unsigned long lastNTPPollTime = 0;
+bool turnOffLED = false;
+
 void(* resetFunc) (void) = 0;
 
 String getAPSSID() {
@@ -79,13 +92,6 @@ String getAPSSID() {
 }
 
 String getMDNSDomain() {
-  // String macAddress = WiFi.macAddress();
-  // int macAddressLength = macAddress.length();
-  // String ending = macAddress.substring(macAddressLength - 5);
-  // ending.remove(2, 1);
-  // ending.toLowerCase();
-
-  // return String(MDNS_DOMAIN) + ending;
   return MDNS_DOMAIN;
 }
 
@@ -101,7 +107,7 @@ String getSpotifyLoginWebpage() {
   char hrefValue[300];
   sprintf(hrefValue, "https://accounts.spotify.com/authorize?client_id=%s&response_type=code&redirect_uri=%s&scope=%s", CLIENT_ID, CALLBACK_URI, SPOTIFY_SCOPE);
 
-  String htmlPrefix = "<html><head><meta charset=\"utf-8\"><meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no\"><title>Magic Box Spotify Login</title><style type=\"text/css\">body,html{min-height:100%}body{font-family:\"Helvetica Neue\",Helvetica,Arial,sans-serif;background-color:#000}h1{font-size:2em;margin-bottom:12px;margin-top:0}#login-container{display:-ms-flexbox;display:flex;height:100%;-ms-flex-direction:column;flex-direction:column;-ms-flex-align:center;align-items:center;margin:0 auto;-ms-flex-pack:center;justify-content:center}#login-container .login{color:#fff;text-align:center;padding:45px}#login-container .login .big-btn{margin:10px 0 20px 0}#login-container .login p{margin:5px 0;font-size:14px}.big-btn{color:#000;background-color:#1ed760;font-size:14px;line-height:1;border-radius:500px;padding:18px 48px 16px;transition-property:background-color;transition-duration:.3s;border-width:0;letter-spacing:2px;min-width:160px;text-transform:uppercase;white-space:normal;cursor:pointer;font-weight:700;text-decoration:none;display:inline-block}.big-btn:hover{background-color:#1fdf64}</style></head><body><div id=\"login-container\"><div class=\"login\"><h1>Magic Box</h1><a id=\"login-button\" href=\"";
+  String htmlPrefix = "<html><head><meta charset=\"utf-8\"><meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no\"><title>Spot Box Spotify Login</title><style type=\"text/css\">body,html{min-height:100%}body{font-family:\"Helvetica Neue\",Helvetica,Arial,sans-serif;background-color:#000}h1{font-size:2em;margin-bottom:12px;margin-top:0}#login-container{display:-ms-flexbox;display:flex;height:100%;-ms-flex-direction:column;flex-direction:column;-ms-flex-align:center;align-items:center;margin:0 auto;-ms-flex-pack:center;justify-content:center}#login-container .login{color:#fff;text-align:center;padding:45px}#login-container .login .big-btn{margin:10px 0 20px 0}#login-container .login p{margin:5px 0;font-size:14px}.big-btn{color:#000;background-color:#1ed760;font-size:14px;line-height:1;border-radius:500px;padding:18px 48px 16px;transition-property:background-color;transition-duration:.3s;border-width:0;letter-spacing:2px;min-width:160px;text-transform:uppercase;white-space:normal;cursor:pointer;font-weight:700;text-decoration:none;display:inline-block}.big-btn:hover{background-color:#1fdf64}</style></head><body><div id=\"login-container\"><div class=\"login\"><h1>Spot Box</h1><a id=\"login-button\" href=\"";
   String htmlSuffix = "\" class=\"big-btn\">Log in with Spotify</a><p class=\"login-desc\">Please login to get access to spotify content.</p><p class=\"login-desc-small\">You will automatically be redirected to this page after login.</p></div></div></body></html>";
 
   return htmlPrefix + String(hrefValue) + htmlSuffix;
@@ -115,18 +121,20 @@ String getDeviceListWebpage(String listHtml) {
 }
 
 void setup() {
-  // Serial.begin(115200);	// Initialize serial communications with the PC
-  // while (!Serial);		// Do nothing if no serial port is opened (added for Arduinos based on ATMEGA32U4)
+  // Serial.begin(115200);
+  // while (!Serial);
 
   pinMode(RED_PIN, OUTPUT);
   pinMode(BLUE_PIN, OUTPUT);
   pinMode(GREEN_PIN, OUTPUT);
 
+  configTime(MY_TZ, MY_NTP_SERVER);
+
 	SPI.begin();			// Init SPI bus
 	mfrc522.PCD_Init();		// Init MFRC522
   client.setInsecure();
 
-  Serial.println("Starting the Magic Box...");
+  Serial.println("Starting the Spot Box...");
 
   Serial.println("Mounting LittleFS...");
   if (!LittleFS.begin()) {
@@ -158,6 +166,7 @@ void setup() {
 void loop() {
   MDNS.update();
   server.handleClient();
+  handleLEDDimming();
   
   // shouldGetCurrentlyPlaying:  Poll spotify for MAX_SPOTIFY_POLLING_TIME
   // isAllowedToPollAgain: The delay between API calls
@@ -180,6 +189,7 @@ void loop() {
   while (true) {
     MDNS.update();
     server.handleClient();
+    handleLEDDimming();
 
     control = 0;
     for (int i = 0; i < 3; i++) {
@@ -278,8 +288,13 @@ String parseNFCTagData(byte *dataBuffer) {
 
 void setupCachedData() {
   WiFi.mode(WIFI_STA);
+
+  String hostname = getAPSSID();
+  hostname.replace(" ", "");
+  WiFi.hostname(hostname.c_str());
+
   updateConnectWiFiIndicator();
-  bool res = wm.autoConnect(getAPSSID().c_str(), getMDNSDomain().c_str());
+  bool res = wm.autoConnect(getAPSSID().c_str(), "nfcspotbox");
   if(!res) {
     resetFunc();
   }
@@ -294,7 +309,7 @@ void setupCachedData() {
       Serial.println("Failed to get access tokens");
       updateConnectSpotifyIndicator();
     } else {
-      updateReadyIndicator();
+      updateReadyIndicator(HIGH);
     }
 
     String savedDeviceId = getFileContents(SPOTIFY_DEVICE_FILE);
@@ -345,7 +360,7 @@ void play(String spotifyUrl) {
   } else {
     spotify.play(deviceId.c_str());
   }
-  updateReadyIndicator();
+  updateReadyIndicator(HIGH);
 }
 
 void pause() {
@@ -360,15 +375,15 @@ void pause() {
   shouldGetCurrentlyPlaying = true;
 
   updateLoadingIndicator();
-  spotify.pause(deviceId.c_str());
-  updateReadyIndicator();
+  spotify.pause();
+  updateReadyIndicator(HIGH);
 }
 
 void getCurrentlyPlaying() {
   shouldGetCurrentlyPlaying = (millis() - lastPlayingTime < MAX_SPOTIFY_POLLING_TIME);
 
   int status = spotify.getCurrentlyPlaying(currentlyPlayingCallback, SPOTIFY_MARKET);
-  if (status != 200) {
+  if (status != 200 || !shouldGetCurrentlyPlaying) {
     lastPlayingId = "";
     lastPlayingTime = 0;
   }
@@ -463,6 +478,7 @@ void handleSpotifyCallback() {
   }
 
   if (refreshToken != NULL) {
+    updateReadyIndicator(HIGH);
     handleSpotifyDevices();
   } else {
     server.send(404, "text/plain", "Failed to load token, check serial monitor");
@@ -530,8 +546,25 @@ void updateLoadingIndicator() {
   digitalWrite(BLUE_PIN, LOW);
 }
 
-void updateReadyIndicator() {
-  digitalWrite(RED_PIN, HIGH);
-  digitalWrite(GREEN_PIN, HIGH);
-  digitalWrite(BLUE_PIN, HIGH);
+void updateReadyIndicator(uint8_t value) {
+  digitalWrite(RED_PIN, value);
+  digitalWrite(GREEN_PIN, value);
+  digitalWrite(BLUE_PIN, value);
+}
+
+void handleLEDDimming() {
+  if (deviceId == "") return;
+  bool isAllowedToPollAgain = (millis() - lastNTPPollTime > MAX_NTP_POLLING_DELAY);
+  if (isAllowedToPollAgain) {
+    lastNTPPollTime = millis();
+
+    time(&now);
+    localtime_r(&now, &tm);
+    
+    if (tm.tm_hour >= LED_OFF_HOUR) {
+      updateReadyIndicator(LOW);
+    } else if (tm.tm_hour >= LED_ON_HOUR) {
+      updateReadyIndicator(HIGH);
+    }
+  }
 }
